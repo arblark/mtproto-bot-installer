@@ -1,0 +1,116 @@
+import aiosqlite
+import json
+import logging
+from config import DB_PATH
+
+logger = logging.getLogger(__name__)
+
+CREATE_TABLES = """
+CREATE TABLE IF NOT EXISTS servers (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id     INTEGER NOT NULL,
+    name        TEXT NOT NULL DEFAULT '',
+    host        TEXT NOT NULL,
+    ssh_port    INTEGER NOT NULL DEFAULT 22,
+    username    TEXT NOT NULL DEFAULT 'root',
+    auth_type   TEXT NOT NULL DEFAULT 'password',  -- 'password' | 'key'
+    credential  TEXT NOT NULL DEFAULT '',           -- encrypted password or key
+    proxy_port  INTEGER DEFAULT 443,
+    domain      TEXT DEFAULT 'apple.com',
+    dns         TEXT DEFAULT '1.1.1.1',
+    secret      TEXT DEFAULT '',
+    status      TEXT DEFAULT 'new',                 -- new | installed | error
+    server_ip   TEXT DEFAULT '',
+    tme_link    TEXT DEFAULT '',
+    created_at  DATETIME DEFAULT CURRENT_TIMESTAMP,
+    updated_at  DATETIME DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS users (
+    user_id     INTEGER PRIMARY KEY,
+    username    TEXT DEFAULT '',
+    first_name  TEXT DEFAULT '',
+    is_admin    INTEGER DEFAULT 0,
+    created_at  DATETIME DEFAULT CURRENT_TIMESTAMP
+);
+"""
+
+
+class Database:
+    def __init__(self, path: str = DB_PATH):
+        self.path = path
+        self._db: aiosqlite.Connection | None = None
+
+    async def init(self):
+        self._db = await aiosqlite.connect(self.path)
+        self._db.row_factory = aiosqlite.Row
+        await self._db.executescript(CREATE_TABLES)
+        await self._db.commit()
+
+    async def close(self):
+        if self._db:
+            await self._db.close()
+
+    async def upsert_user(self, user_id: int, username: str = "", first_name: str = "", is_admin: bool = False):
+        await self._db.execute(
+            """INSERT INTO users (user_id, username, first_name, is_admin)
+               VALUES (?, ?, ?, ?)
+               ON CONFLICT(user_id) DO UPDATE SET
+                 username=excluded.username,
+                 first_name=excluded.first_name""",
+            (user_id, username, first_name, int(is_admin)),
+        )
+        await self._db.commit()
+
+    async def add_server(
+        self,
+        user_id: int,
+        name: str,
+        host: str,
+        ssh_port: int,
+        username: str,
+        auth_type: str,
+        credential: str,
+        proxy_port: int = 443,
+        domain: str = "apple.com",
+        dns: str = "1.1.1.1",
+    ) -> int:
+        cursor = await self._db.execute(
+            """INSERT INTO servers
+               (user_id, name, host, ssh_port, username, auth_type, credential, proxy_port, domain, dns)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (user_id, name, host, ssh_port, username, auth_type, credential, proxy_port, domain, dns),
+        )
+        await self._db.commit()
+        return cursor.lastrowid
+
+    async def get_servers(self, user_id: int) -> list[dict]:
+        cursor = await self._db.execute(
+            "SELECT * FROM servers WHERE user_id = ? ORDER BY created_at DESC", (user_id,)
+        )
+        rows = await cursor.fetchall()
+        return [dict(r) for r in rows]
+
+    async def get_server(self, server_id: int, user_id: int) -> dict | None:
+        cursor = await self._db.execute(
+            "SELECT * FROM servers WHERE id = ? AND user_id = ?", (server_id, user_id)
+        )
+        row = await cursor.fetchone()
+        return dict(row) if row else None
+
+    async def update_server(self, server_id: int, **kwargs):
+        if not kwargs:
+            return
+        sets = ", ".join(f"{k} = ?" for k in kwargs)
+        vals = list(kwargs.values())
+        vals.append(server_id)
+        await self._db.execute(
+            f"UPDATE servers SET {sets}, updated_at = CURRENT_TIMESTAMP WHERE id = ?", vals
+        )
+        await self._db.commit()
+
+    async def delete_server(self, server_id: int, user_id: int):
+        await self._db.execute(
+            "DELETE FROM servers WHERE id = ? AND user_id = ?", (server_id, user_id)
+        )
+        await self._db.commit()
