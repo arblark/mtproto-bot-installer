@@ -1,14 +1,15 @@
 from __future__ import annotations
 
+import logging
 import os
-from pathlib import Path
 from cryptography.fernet import Fernet
+
+from config import ENV_PATH
+
+logger = logging.getLogger(__name__)
 
 _KEY_ENV = "ENCRYPT_KEY"
 _fernet: Fernet | None = None
-
-_BASE_DIR = Path(__file__).resolve().parent
-_ENV_PATH = _BASE_DIR / ".env"
 
 
 def init_encryption() -> None:
@@ -18,24 +19,29 @@ def init_encryption() -> None:
 
     if raw:
         _fernet = Fernet(raw.encode())
+        logger.info("ENCRYPT_KEY загружен из .env")
         return
 
     key = Fernet.generate_key()
     _fernet = Fernet(key)
+    key_str = key.decode()
 
-    os.environ[_KEY_ENV] = key.decode()
+    os.environ[_KEY_ENV] = key_str
 
     try:
         content = ""
-        if _ENV_PATH.exists():
-            content = _ENV_PATH.read_text(encoding="utf-8")
+        if ENV_PATH.exists():
+            content = ENV_PATH.read_text(encoding="utf-8")
         if _KEY_ENV not in content:
-            with _ENV_PATH.open("a", encoding="utf-8") as f:
+            with ENV_PATH.open("a", encoding="utf-8") as f:
                 if content and not content.endswith("\n"):
                     f.write("\n")
-                f.write(f"{_KEY_ENV}={key.decode()}\n")
-    except OSError:
-        pass
+                f.write(f"{_KEY_ENV}={key_str}\n")
+            logger.info("ENCRYPT_KEY сгенерирован и записан в %s", ENV_PATH)
+        else:
+            logger.info("ENCRYPT_KEY уже есть в файле")
+    except OSError as e:
+        logger.error("Не удалось записать ENCRYPT_KEY в %s: %s", ENV_PATH, e)
 
 
 def _get_fernet() -> Fernet:
