@@ -7,6 +7,7 @@ from aiogram.client.default import DefaultBotProperties
 from aiogram.fsm.storage.memory import MemoryStorage
 
 from config import BOT_TOKEN
+from crypto import init_encryption
 from database import Database
 from bot import router, DbMiddleware
 
@@ -22,6 +23,9 @@ async def main():
     if not BOT_TOKEN:
         logger.error("BOT_TOKEN не задан. Создайте .env файл (см. .env.example)")
         sys.exit(1)
+
+    init_encryption()
+    logger.info("Шифрование инициализировано")
 
     db = Database()
     await db.init()

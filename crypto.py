@@ -1,55 +1,56 @@
 from __future__ import annotations
 
 import os
-import base64
+from pathlib import Path
 from cryptography.fernet import Fernet
 
 _KEY_ENV = "ENCRYPT_KEY"
-_key: bytes | None = None
+_fernet: Fernet | None = None
+
+_BASE_DIR = Path(__file__).resolve().parent
+_ENV_PATH = _BASE_DIR / ".env"
 
 
-def _get_key() -> bytes:
-    global _key
-    if _key:
-        return _key
-
+def init_encryption() -> None:
+    """Must be called once at startup, after load_dotenv()."""
+    global _fernet
     raw = os.getenv(_KEY_ENV, "")
+
     if raw:
-        _key = raw.encode()
-    else:
-        _key = Fernet.generate_key()
-        _write_key_to_env(_key.decode())
+        _fernet = Fernet(raw.encode())
+        return
 
-    return _key
+    key = Fernet.generate_key()
+    _fernet = Fernet(key)
 
+    os.environ[_KEY_ENV] = key.decode()
 
-def _write_key_to_env(key_str: str) -> None:
-    """Append ENCRYPT_KEY to .env if missing."""
-    env_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
     try:
         content = ""
-        if os.path.exists(env_path):
-            with open(env_path, "r", encoding="utf-8") as f:
-                content = f.read()
-
+        if _ENV_PATH.exists():
+            content = _ENV_PATH.read_text(encoding="utf-8")
         if _KEY_ENV not in content:
-            with open(env_path, "a", encoding="utf-8") as f:
+            with _ENV_PATH.open("a", encoding="utf-8") as f:
                 if content and not content.endswith("\n"):
                     f.write("\n")
-                f.write(f"{_KEY_ENV}={key_str}\n")
+                f.write(f"{_KEY_ENV}={key.decode()}\n")
     except OSError:
         pass
+
+
+def _get_fernet() -> Fernet:
+    if _fernet is None:
+        init_encryption()
+    return _fernet
 
 
 def encrypt(plaintext: str) -> str:
     if not plaintext:
         return ""
-    f = Fernet(_get_key())
-    return f.encrypt(plaintext.encode("utf-8")).decode("ascii")
+    return _get_fernet().encrypt(plaintext.encode("utf-8")).decode("ascii")
 
 
 def decrypt(token: str) -> str:
     if not token:
         return ""
-    f = Fernet(_get_key())
-    return f.decrypt(token.encode("ascii")).decode("utf-8")
+    return _get_fernet().decrypt(token.encode("ascii")).decode("utf-8")
