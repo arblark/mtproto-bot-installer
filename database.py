@@ -1,7 +1,7 @@
 import aiosqlite
-import json
 import logging
 from config import DB_PATH
+from crypto import encrypt, decrypt
 
 logger = logging.getLogger(__name__)
 
@@ -75,28 +75,38 @@ class Database:
         domain: str = "apple.com",
         dns: str = "1.1.1.1",
     ) -> int:
+        encrypted_credential = encrypt(credential)
         cursor = await self._db.execute(
             """INSERT INTO servers
                (user_id, name, host, ssh_port, username, auth_type, credential, proxy_port, domain, dns)
                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-            (user_id, name, host, ssh_port, username, auth_type, credential, proxy_port, domain, dns),
+            (user_id, name, host, ssh_port, username, auth_type, encrypted_credential, proxy_port, domain, dns),
         )
         await self._db.commit()
         return cursor.lastrowid
+
+    @staticmethod
+    def _decrypt_row(row: dict) -> dict:
+        if row.get("credential"):
+            try:
+                row["credential"] = decrypt(row["credential"])
+            except Exception:
+                pass
+        return row
 
     async def get_servers(self, user_id: int) -> list[dict]:
         cursor = await self._db.execute(
             "SELECT * FROM servers WHERE user_id = ? ORDER BY created_at DESC", (user_id,)
         )
         rows = await cursor.fetchall()
-        return [dict(r) for r in rows]
+        return [self._decrypt_row(dict(r)) for r in rows]
 
     async def get_server(self, server_id: int, user_id: int) -> dict | None:
         cursor = await self._db.execute(
             "SELECT * FROM servers WHERE id = ? AND user_id = ?", (server_id, user_id)
         )
         row = await cursor.fetchone()
-        return dict(row) if row else None
+        return self._decrypt_row(dict(row)) if row else None
 
     async def update_server(self, server_id: int, **kwargs):
         if not kwargs:
