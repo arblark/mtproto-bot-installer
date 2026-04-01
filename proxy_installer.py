@@ -1,6 +1,8 @@
+from __future__ import annotations
+
 import logging
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 from ssh_manager import SSHManager
 from config import (
@@ -14,6 +16,8 @@ from config import (
 )
 
 logger = logging.getLogger(__name__)
+
+SCRIPT_PATH = "/tmp/mtproto-setup.sh"
 
 
 @dataclass
@@ -39,11 +43,68 @@ class ProxyInfo:
     error: str = ""
 
 
+def _parse_config(text: str) -> dict:
+    """Parse /etc/mtproto-proxy/config key=value file."""
+    result: dict = {}
+    for line in text.splitlines():
+        if "=" in line:
+            k, v = line.split("=", 1)
+            result[k.strip()] = v.strip()
+    return result
+
+
 class ProxyInstaller:
-    """Orchestrates MTProto proxy installation via SSH."""
+    """Installs MTProto proxy by downloading and running the official
+    mtproto-setup.sh script with --auto and environment variables."""
 
     def __init__(self, ssh: SSHManager):
         self.ssh = ssh
+
+    # ── helpers ──────────────────────────────────────────────────
+
+    async def _download_script(self) -> bool:
+        """Download mtproto-setup.sh to /tmp on the remote server."""
+        r = await self.ssh.execute(
+            f"curl -sSL {MTPROTO_SETUP_URL} -o {SCRIPT_PATH} && chmod +x {SCRIPT_PATH}",
+            timeout=30,
+        )
+        if not r.ok:
+            r = await self.ssh.execute(
+                f"wget -qO {SCRIPT_PATH} {MTPROTO_SETUP_URL} && chmod +x {SCRIPT_PATH}",
+                timeout=30,
+            )
+        return r.ok
+
+    def _build_env(self, cfg: ProxyConfig, server_ip: str = "") -> str:
+        """Build environment variable prefix for --auto mode."""
+        parts = [
+            f"MT_PORT={cfg.port}",
+            f"MT_DOMAIN={cfg.domain}",
+            f"MT_DNS={cfg.dns}",
+            f"MT_IP_MODE={cfg.ip_mode}",
+            f"MT_CONTAINER={cfg.container}",
+        ]
+        if server_ip:
+            parts.insert(0, f"MT_SERVER_IP={server_ip}")
+        return " ".join(parts)
+
+    async def _read_remote_config(self) -> dict:
+        r = await self.ssh.execute("cat /etc/mtproto-proxy/config 2>/dev/null")
+        if r.ok:
+            return _parse_config(r.stdout)
+        return {}
+
+    async def _detect_ip(self) -> str:
+        r = await self.ssh.execute(
+            "curl -4 -s --max-time 5 https://ifconfig.me 2>/dev/null"
+            " || curl -4 -s --max-time 5 https://api.ipify.org 2>/dev/null"
+            " || hostname -I 2>/dev/null | awk '{print $1}'"
+        )
+        if r.ok:
+            return r.stdout.strip().split("\n")[0].strip()
+        return ""
+
+    # ── public API ──────────────────────────────────────────────
 
     async def check_server(self) -> dict:
         """Quick server health check: OS, Docker, existing proxy."""
@@ -59,21 +120,16 @@ class ProxyInstaller:
         r = await self.ssh.execute("docker --version 2>/dev/null")
         info["docker"] = r.ok
 
-        r = await self.ssh.execute("docker ps --format '{{.Names}}' 2>/dev/null | grep -w mtproto")
-        info["proxy_running"] = r.ok and "mtproto" in r.stdout
-
         r = await self.ssh.execute(
-            "curl -4 -s --max-time 5 https://ifconfig.me 2>/dev/null"
-            " || curl -4 -s --max-time 5 https://api.ipify.org 2>/dev/null"
-            " || hostname -I 2>/dev/null | awk '{print $1}'"
+            "docker ps --format '{{.Names}}' 2>/dev/null | grep -w mtproto"
         )
-        if r.ok:
-            info["ip"] = r.stdout.strip().split("\n")[0].strip()
+        info["proxy_running"] = r.ok and "mtproto" in r.stdout
+        info["ip"] = await self._detect_ip()
 
         return info
 
     async def install(self, cfg: ProxyConfig, progress_cb=None) -> ProxyInfo:
-        """Full installation flow. progress_cb(step, message) for live updates."""
+        """Download mtproto-setup.sh → run with --auto and env vars."""
         result = ProxyInfo()
 
         async def _progress(step: str, msg: str):
@@ -89,112 +145,63 @@ class ProxyInstaller:
             os_name = info.get("os", "Linux")
             await _progress("check", f"Сервер: {os_name}, IP: {info['ip']}")
 
-            if not info["docker"]:
-                await _progress("docker", "Установка Docker...")
-                r = await self.ssh.execute(
-                    "if command -v apt-get &>/dev/null; then"
-                    "  apt-get update -qq && apt-get install -y -qq docker.io;"
-                    " elif command -v yum &>/dev/null; then"
-                    "  yum install -y docker && systemctl start docker;"
-                    " elif command -v dnf &>/dev/null; then"
-                    "  dnf install -y docker && systemctl start docker;"
-                    " else"
-                    "  curl -fsSL https://get.docker.com | sh;"
-                    " fi"
-                    " && systemctl enable docker && systemctl start docker",
-                    timeout=INSTALL_TIMEOUT,
+            await _progress("download", "Скачивание скрипта установки...")
+            if not await self._download_script():
+                result.error = "Не удалось скачать mtproto-setup.sh"
+                return result
+            await _progress("download", "Скрипт скачан")
+
+            await _progress("install", "Запуск установки (--auto)...")
+            env_prefix = self._build_env(cfg, server_ip=result.server_ip)
+            r = await self.ssh.execute(
+                f"{env_prefix} bash {SCRIPT_PATH} --auto",
+                timeout=INSTALL_TIMEOUT,
+            )
+
+            output = r.stdout + "\n" + r.stderr
+            if not r.ok:
+                result.error = (
+                    f"Скрипт завершился с ошибкой (код {r.exit_code}):\n"
+                    f"{output[-800:]}"
                 )
-                if not r.ok:
-                    result.error = f"Не удалось установить Docker:\n{r.stderr[:500]}"
-                    return result
-                await _progress("docker", "Docker установлен")
+                return result
+
+            await _progress("install", "Скрипт выполнен успешно")
+
+            await _progress("config", "Чтение конфигурации...")
+            cv = await self._read_remote_config()
+            if cv:
+                result.server_ip = cv.get("SERVER_IP", info["ip"])
+                result.port = (
+                    int(cv["EXT_PORT"])
+                    if cv.get("EXT_PORT", "").isdigit()
+                    else cfg.port
+                )
+                result.secret = cv.get("SECRET", "")
+                result.domain = cv.get("FAKE_DOMAIN", cfg.domain)
+                result.dns = cv.get("DNS_SERVER", cfg.dns)
+                result.container = cv.get("CONTAINER_NAME", cfg.container)
             else:
-                await _progress("docker", "Docker уже установлен")
+                secret_match = re.search(r"secret=([a-f0-9]+)", output)
+                if secret_match:
+                    result.secret = secret_match.group(1)
+                result.port = cfg.port
+                result.domain = cfg.domain
+                result.dns = cfg.dns
+                result.container = cfg.container
 
-            await _progress("pull", "Скачивание образа mtg...")
-            r = await self.ssh.execute("docker pull nineseconds/mtg", timeout=INSTALL_TIMEOUT)
-            if not r.ok:
-                result.error = f"Не удалось скачать образ:\n{r.stderr[:500]}"
-                return result
-            await _progress("pull", "Образ mtg загружен")
+            if result.server_ip and result.secret:
+                ip = result.server_ip
+                result.tme_link = (
+                    f"https://t.me/proxy?server={ip}"
+                    f"&port={result.port}&secret={result.secret}"
+                )
+                result.tg_link = (
+                    f"tg://proxy?server={ip}"
+                    f"&port={result.port}&secret={result.secret}"
+                )
 
-            await _progress("secret", "Генерация секрета...")
-            r = await self.ssh.execute(
-                f"docker run --rm nineseconds/mtg generate-secret --hex {cfg.domain}",
-                timeout=60,
-            )
-            if not r.ok or not r.stdout.strip():
-                result.error = f"Не удалось сгенерировать секрет:\n{r.stderr[:500]}"
-                return result
-            secret = r.stdout.strip()
-            result.secret = secret
-            result.domain = cfg.domain
-            result.dns = cfg.dns
-            result.port = cfg.port
-            result.container = cfg.container
-            await _progress("secret", "Секрет сгенерирован")
-
-            await _progress("container", "Запуск контейнера...")
-            await self.ssh.execute(f"docker rm -f {cfg.container} 2>/dev/null || true")
-
-            run_cmd = (
-                f"docker run -d"
-                f" --name {cfg.container}"
-                f" --restart always"
-                f" -p {cfg.port}:3128"
-                f" --dns {cfg.dns}"
-                f" nineseconds/mtg simple-run"
-                f" -n {cfg.dns}"
-                f" -i {cfg.ip_mode}"
-                f" 0.0.0.0:3128"
-                f" {secret}"
-            )
-            r = await self.ssh.execute(run_cmd, timeout=60)
-            if not r.ok:
-                result.error = f"Не удалось запустить контейнер:\n{r.stderr[:500]}"
-                return result
-
-            # Wait for container
-            r = await self.ssh.execute(
-                f"for i in $(seq 1 10); do"
-                f"  docker ps --format '{{{{.Names}}}}' | grep -qw {cfg.container} && exit 0;"
-                f"  sleep 1;"
-                f" done; exit 1"
-            )
-            if not r.ok:
-                result.error = "Контейнер не запустился за 10 секунд"
-                return result
-            await _progress("container", "Контейнер запущен")
-
-            await _progress("firewall", "Настройка файрвола...")
-            await self.ssh.execute(
-                f"command -v ufw &>/dev/null && ufw allow {cfg.port}/tcp 2>/dev/null;"
-                f" command -v firewall-cmd &>/dev/null"
-                f" && firewall-cmd --permanent --add-port={cfg.port}/tcp 2>/dev/null"
-                f" && firewall-cmd --reload 2>/dev/null;"
-                f" true"
-            )
-            await _progress("firewall", "Файрвол настроен")
-
-            await _progress("config", "Сохранение конфигурации...")
-            config_content = (
-                f"SERVER_IP={result.server_ip}\n"
-                f"EXT_PORT={cfg.port}\n"
-                f"INTERNAL_PORT=3128\n"
-                f"FAKE_DOMAIN={cfg.domain}\n"
-                f"DNS_SERVER={cfg.dns}\n"
-                f"IP_PREFER={cfg.ip_mode}\n"
-                f"CONTAINER_NAME={cfg.container}\n"
-                f"SECRET={secret}\n"
-            )
-            await self.ssh.execute("mkdir -p /etc/mtproto-proxy")
-            await self.ssh.upload_string(config_content, "/etc/mtproto-proxy/config")
-
-            ip = result.server_ip
-            result.tme_link = f"https://t.me/proxy?server={ip}&port={cfg.port}&secret={secret}"
-            result.tg_link = f"tg://proxy?server={ip}&port={cfg.port}&secret={secret}"
             result.status = "running"
-
             await _progress("done", "Установка завершена!")
 
         except Exception as e:
@@ -204,49 +211,55 @@ class ProxyInstaller:
         return result
 
     async def get_status(self, container: str = DEFAULT_CONTAINER) -> ProxyInfo:
-        """Get current proxy status from remote server."""
+        """Read /etc/mtproto-proxy/config and docker status."""
         result = ProxyInfo()
 
-        r = await self.ssh.execute("cat /etc/mtproto-proxy/config 2>/dev/null")
-        if r.ok:
-            for line in r.stdout.splitlines():
-                if "=" in line:
-                    k, v = line.split("=", 1)
-                    k, v = k.strip(), v.strip()
-                    if k == "SERVER_IP":
-                        result.server_ip = v
-                    elif k == "EXT_PORT":
-                        result.port = int(v) if v.isdigit() else 443
-                    elif k == "SECRET":
-                        result.secret = v
-                    elif k == "FAKE_DOMAIN":
-                        result.domain = v
-                    elif k == "DNS_SERVER":
-                        result.dns = v
-                    elif k == "CONTAINER_NAME":
-                        result.container = v
+        cv = await self._read_remote_config()
+        if cv:
+            result.server_ip = cv.get("SERVER_IP", "")
+            result.port = (
+                int(cv["EXT_PORT"])
+                if cv.get("EXT_PORT", "").isdigit()
+                else 443
+            )
+            result.secret = cv.get("SECRET", "")
+            result.domain = cv.get("FAKE_DOMAIN", "")
+            result.dns = cv.get("DNS_SERVER", "")
+            result.container = cv.get("CONTAINER_NAME", container)
 
-        r = await self.ssh.execute(f"docker ps --format '{{{{.Names}}}}' 2>/dev/null | grep -qw {container}")
+        r = await self.ssh.execute(
+            f"docker ps --format '{{{{.Names}}}}' 2>/dev/null | grep -qw {container}"
+        )
         result.status = "running" if r.ok else "stopped"
 
         if result.server_ip and result.secret:
             result.tme_link = (
-                f"https://t.me/proxy?server={result.server_ip}&port={result.port}&secret={result.secret}"
+                f"https://t.me/proxy?server={result.server_ip}"
+                f"&port={result.port}&secret={result.secret}"
             )
             result.tg_link = (
-                f"tg://proxy?server={result.server_ip}&port={result.port}&secret={result.secret}"
+                f"tg://proxy?server={result.server_ip}"
+                f"&port={result.port}&secret={result.secret}"
             )
 
         return result
 
     async def uninstall(self, container: str = DEFAULT_CONTAINER) -> str:
-        """Remove proxy container and config."""
-        messages = []
+        """Download script and run --uninstall (auto-answer 'yes' to prompts)."""
+        if await self._download_script():
+            r = await self.ssh.execute(
+                f"echo -e 'y\\ny\\n' | bash {SCRIPT_PATH} --uninstall 2>&1",
+                timeout=60,
+            )
+            return "✓ Прокси удалён через скрипт"
 
+        messages = []
         r = await self.ssh.execute(f"docker rm -f {container} 2>/dev/null")
         messages.append("Контейнер удалён" if r.ok else "Контейнер не найден")
 
-        r = await self.ssh.execute("cat /etc/mtproto-proxy/config 2>/dev/null | grep EXT_PORT")
+        r = await self.ssh.execute(
+            "cat /etc/mtproto-proxy/config 2>/dev/null | grep EXT_PORT"
+        )
         if r.ok:
             port = r.stdout.strip().split("=")[-1].strip()
             if port.isdigit():
@@ -261,9 +274,6 @@ class ProxyInstaller:
         await self.ssh.execute("rm -rf /etc/mtproto-proxy")
         messages.append("Конфигурация удалена")
 
-        await self.ssh.execute(f"docker rmi nineseconds/mtg 2>/dev/null || true")
-        messages.append("Docker-образ удалён")
-
         return "\n".join(f"✓ {m}" for m in messages)
 
     async def restart(self, container: str = DEFAULT_CONTAINER) -> bool:
@@ -271,48 +281,54 @@ class ProxyInstaller:
         return r.ok
 
     async def update(self, container: str = DEFAULT_CONTAINER) -> ProxyInfo:
-        """Pull latest image and restart with saved config."""
+        """Download script and run --update."""
         status = await self.get_status(container)
         if not status.secret:
             status.error = "Конфигурация не найдена на сервере"
             return status
 
-        r = await self.ssh.execute("docker pull nineseconds/mtg", timeout=INSTALL_TIMEOUT)
-        if not r.ok:
-            status.error = f"Не удалось обновить образ:\n{r.stderr[:300]}"
+        if not await self._download_script():
+            status.error = "Не удалось скачать скрипт для обновления"
             return status
 
-        await self.ssh.execute(f"docker rm -f {container} 2>/dev/null")
-
-        r = await self.ssh.execute("cat /etc/mtproto-proxy/config 2>/dev/null")
-        cfg_vars: dict = {}
-        if r.ok:
-            for line in r.stdout.splitlines():
-                if "=" in line:
-                    k, v = line.split("=", 1)
-                    cfg_vars[k.strip()] = v.strip()
-
-        ip_mode = cfg_vars.get("IP_PREFER", DEFAULT_IP_MODE)
-        dns = cfg_vars.get("DNS_SERVER", DEFAULT_DNS)
-        port = cfg_vars.get("EXT_PORT", str(DEFAULT_PORT))
-        internal = cfg_vars.get("INTERNAL_PORT", "3128")
-
-        run_cmd = (
-            f"docker run -d"
-            f" --name {container}"
-            f" --restart always"
-            f" -p {port}:{internal}"
-            f" --dns {dns}"
-            f" nineseconds/mtg simple-run"
-            f" -n {dns}"
-            f" -i {ip_mode}"
-            f" 0.0.0.0:{internal}"
-            f" {status.secret}"
+        r = await self.ssh.execute(
+            f"bash {SCRIPT_PATH} --update 2>&1",
+            timeout=INSTALL_TIMEOUT,
         )
-        r = await self.ssh.execute(run_cmd, timeout=60)
         if not r.ok:
-            status.error = f"Не удалось перезапустить:\n{r.stderr[:300]}"
+            status.error = f"Ошибка обновления:\n{(r.stdout + r.stderr)[-500:]}"
             return status
 
-        status.status = "running"
-        return status
+        updated = await self.get_status(container)
+        updated.status = "running"
+        return updated
+
+    async def doctor(self, container: str = DEFAULT_CONTAINER) -> str:
+        """Run mtg doctor directly (not in the script — no --doctor flag)."""
+        r = await self.ssh.execute(
+            f"docker ps --format '{{{{.Names}}}}' 2>/dev/null | grep -qw {container}"
+        )
+        if not r.ok:
+            return "Контейнер не запущен — диагностика недоступна"
+
+        cv = await self._read_remote_config()
+        dns = cv.get("DNS_SERVER", DEFAULT_DNS)
+        ip_mode = cv.get("IP_PREFER", DEFAULT_IP_MODE)
+        internal = cv.get("INTERNAL_PORT", "3128")
+        secret = cv.get("SECRET", "")
+        if not secret:
+            return "Секрет не найден в конфигурации"
+
+        r = await self.ssh.execute(
+            f"docker exec {container} /mtg doctor --simple-run"
+            f" -n {dns} -i {ip_mode} 0.0.0.0:{internal} {secret} 2>&1",
+            timeout=30,
+        )
+        return r.stdout.strip() or r.stderr.strip() or "Нет вывода"
+
+    async def get_logs(self, container: str = DEFAULT_CONTAINER, lines: int = 30) -> str:
+        """Get last N lines of container logs."""
+        r = await self.ssh.execute(f"docker logs --tail {lines} {container} 2>&1")
+        if r.ok:
+            return r.stdout.strip()[-2000:] or "Логи пусты"
+        return "Не удалось получить логи"

@@ -29,10 +29,17 @@ def server_actions(server_id: int, status: str) -> InlineKeyboardMarkup:
         buttons.append([
             InlineKeyboardButton(text="🚀 Установить прокси", callback_data=f"install:{server_id}")
         ])
+        buttons.append([
+            InlineKeyboardButton(text="🔌 Проверить SSH", callback_data=f"test_ssh:{server_id}")
+        ])
     elif status == "installed":
         buttons.append([
             InlineKeyboardButton(text="📊 Статус", callback_data=f"status:{server_id}"),
             InlineKeyboardButton(text="🔗 Ссылки", callback_data=f"links:{server_id}"),
+        ])
+        buttons.append([
+            InlineKeyboardButton(text="🩺 Диагностика", callback_data=f"doctor:{server_id}"),
+            InlineKeyboardButton(text="📜 Логи", callback_data=f"logs:{server_id}"),
         ])
         buttons.append([
             InlineKeyboardButton(text="🔄 Обновить", callback_data=f"update:{server_id}"),
@@ -44,6 +51,9 @@ def server_actions(server_id: int, status: str) -> InlineKeyboardMarkup:
     elif status == "error":
         buttons.append([
             InlineKeyboardButton(text="🔁 Повторить установку", callback_data=f"install:{server_id}")
+        ])
+        buttons.append([
+            InlineKeyboardButton(text="🔌 Проверить SSH", callback_data=f"test_ssh:{server_id}")
         ])
 
     buttons.append([
@@ -75,6 +85,18 @@ def settings_menu(server_id: int) -> InlineKeyboardMarkup:
 def back_to_server(server_id: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="⬅️ Назад", callback_data=f"server:{server_id}")]
+    ])
+
+
+def dns_selector() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="1.1.1.1 — Cloudflare", callback_data="dns:1.1.1.1")],
+        [InlineKeyboardButton(text="8.8.8.8 — Google", callback_data="dns:8.8.8.8")],
+        [InlineKeyboardButton(text="9.9.9.9 — Quad9", callback_data="dns:9.9.9.9")],
+        [InlineKeyboardButton(text="77.88.8.8 — Яндекс", callback_data="dns:77.88.8.8")],
+        [InlineKeyboardButton(text="208.67.222.222 — OpenDNS", callback_data="dns:208.67.222.222")],
+        [InlineKeyboardButton(text="✏️ Ввести свой DNS", callback_data="dns:custom")],
+        [InlineKeyboardButton(text="❌ Отмена", callback_data="cancel")],
     ])
 
 

@@ -26,6 +26,8 @@ class AddServer(StatesGroup):
     credential = State()
     proxy_port = State()
     domain = State()
+    dns = State()
+    dns_custom = State()
 
 
 class EditSetting(StatesGroup):
@@ -280,14 +282,65 @@ async def fsm_proxy_port(message: Message, state: FSMContext):
     )
 
 
+DNS_INFO = {
+    "1.1.1.1": "Cloudflare — быстрый, приватный, без цензуры",
+    "8.8.8.8": "Google — надёжный, глобальная сеть, высокий аптайм",
+    "9.9.9.9": "Quad9 — блокирует вредоносные домены, приватный",
+    "77.88.8.8": "Яндекс — быстрый в РФ/СНГ, фильтрация мошенников",
+    "208.67.222.222": "OpenDNS (Cisco) — гибкая фильтрация, надёжный",
+}
+
+
 @router.message(AddServer.domain)
-async def fsm_domain(message: Message, state: FSMContext, db: Database):
+async def fsm_domain(message: Message, state: FSMContext):
     domain = message.text.strip() or DEFAULT_DOMAIN
+    await state.update_data(domain=domain)
+    await state.set_state(AddServer.dns)
+
+    lines = ["📡 <b>Выберите DNS-сервер:</b>\n"]
+    for ip, desc in DNS_INFO.items():
+        lines.append(f"<code>{ip}</code> — {desc}")
+    lines.append("\n<i>DNS влияет на скорость резолва доменов внутри прокси.\n"
+                 "Cloudflare (1.1.1.1) — лучший выбор для большинства.</i>")
+
+    await message.answer(
+        "\n".join(lines),
+        reply_markup=kb.dns_selector(),
+        parse_mode="HTML",
+    )
+
+
+@router.callback_query(F.data.startswith("dns:"), AddServer.dns)
+async def fsm_dns_select(call: CallbackQuery, state: FSMContext, db: Database):
+    value = call.data.split(":", 1)[1]
+
+    if value == "custom":
+        await state.set_state(AddServer.dns_custom)
+        await call.message.edit_text(
+            "📡 Введите <b>IP-адрес DNS-сервера</b>:\n"
+            "<i>Например: 1.0.0.1</i>",
+            reply_markup=kb.cancel_kb(),
+            parse_mode="HTML",
+        )
+        return
+
+    await _save_server(call.message, state, db, call.from_user.id, value)
+
+
+@router.message(AddServer.dns_custom)
+async def fsm_dns_custom(message: Message, state: FSMContext, db: Database):
+    dns = message.text.strip()
+    if not dns:
+        dns = DEFAULT_DNS
+    await _save_server(message, state, db, message.from_user.id, dns)
+
+
+async def _save_server(msg, state: FSMContext, db: Database, user_id: int, dns: str):
     data = await state.get_data()
     await state.clear()
 
     server_id = await db.add_server(
-        user_id=message.from_user.id,
+        user_id=user_id,
         name=data["name"],
         host=data["host"],
         ssh_port=data["ssh_port"],
@@ -295,20 +348,26 @@ async def fsm_domain(message: Message, state: FSMContext, db: Database):
         auth_type=data["auth_type"],
         credential=data["credential"],
         proxy_port=data["proxy_port"],
-        domain=domain,
+        domain=data["domain"],
+        dns=dns,
     )
 
-    await message.answer(
+    dns_label = DNS_INFO.get(dns, dns)
+    text = (
         f"✅ <b>Сервер добавлен!</b>\n\n"
         f"📛 {data['name']}\n"
         f"🌐 {data['host']}:{data['ssh_port']}\n"
         f"👤 {data['username']}\n"
         f"🔌 Порт прокси: {data['proxy_port']}\n"
-        f"🌍 Домен: {domain}\n\n"
-        f"Нажмите «Установить прокси» для запуска установки.",
-        reply_markup=kb.server_actions(server_id, "new"),
-        parse_mode="HTML",
+        f"🌍 Домен: {data['domain']}\n"
+        f"📡 DNS: {dns} ({dns_label})\n\n"
+        f"Нажмите «Установить прокси» для запуска установки."
     )
+
+    if hasattr(msg, "edit_text"):
+        await msg.edit_text(text, reply_markup=kb.server_actions(server_id, "new"), parse_mode="HTML")
+    else:
+        await msg.answer(text, reply_markup=kb.server_actions(server_id, "new"), parse_mode="HTML")
 
 
 # ──────────────────────────────────────────────────────────
@@ -545,6 +604,139 @@ async def cb_links(call: CallbackQuery, db: Database):
         parse_mode="HTML",
         disable_web_page_preview=True,
     )
+
+
+# ──────────────────────────────────────────────────────────
+# Doctor / Logs / Test SSH
+# ──────────────────────────────────────────────────────────
+
+@router.callback_query(F.data.startswith("doctor:"))
+async def cb_doctor(call: CallbackQuery, db: Database, bot: Bot):
+    server_id = int(call.data.split(":")[1])
+    server = await db.get_server(server_id, call.from_user.id)
+    if not server:
+        await call.answer("Сервер не найден", show_alert=True)
+        return
+
+    await call.message.edit_text("🩺 Запуск диагностики...", parse_mode="HTML")
+
+    try:
+        ssh = SSHManager(
+            host=server["host"],
+            port=server["ssh_port"],
+            username=server["username"],
+            password=server["credential"] if server["auth_type"] == "password" else None,
+            key=server["credential"] if server["auth_type"] == "key" else None,
+        )
+        async with ssh:
+            installer = ProxyInstaller(ssh)
+            report = await installer.doctor()
+
+        await bot.edit_message_text(
+            f"🩺 <b>Диагностика mtg</b>\n\n<pre>{report[:3500]}</pre>",
+            chat_id=call.message.chat.id,
+            message_id=call.message.message_id,
+            reply_markup=kb.back_to_server(server_id),
+            parse_mode="HTML",
+        )
+    except Exception as e:
+        await bot.edit_message_text(
+            f"❌ Ошибка диагностики:\n{e}",
+            chat_id=call.message.chat.id,
+            message_id=call.message.message_id,
+            reply_markup=kb.server_actions(server_id, server["status"]),
+            parse_mode="HTML",
+        )
+
+
+@router.callback_query(F.data.startswith("logs:"))
+async def cb_logs(call: CallbackQuery, db: Database, bot: Bot):
+    server_id = int(call.data.split(":")[1])
+    server = await db.get_server(server_id, call.from_user.id)
+    if not server:
+        await call.answer("Сервер не найден", show_alert=True)
+        return
+
+    await call.message.edit_text("📜 Получение логов...", parse_mode="HTML")
+
+    try:
+        ssh = SSHManager(
+            host=server["host"],
+            port=server["ssh_port"],
+            username=server["username"],
+            password=server["credential"] if server["auth_type"] == "password" else None,
+            key=server["credential"] if server["auth_type"] == "key" else None,
+        )
+        async with ssh:
+            installer = ProxyInstaller(ssh)
+            logs = await installer.get_logs()
+
+        await bot.edit_message_text(
+            f"📜 <b>Логи контейнера</b>\n\n<pre>{logs[:3500]}</pre>",
+            chat_id=call.message.chat.id,
+            message_id=call.message.message_id,
+            reply_markup=kb.back_to_server(server_id),
+            parse_mode="HTML",
+        )
+    except Exception as e:
+        await bot.edit_message_text(
+            f"❌ Ошибка:\n{e}",
+            chat_id=call.message.chat.id,
+            message_id=call.message.message_id,
+            reply_markup=kb.server_actions(server_id, server["status"]),
+            parse_mode="HTML",
+        )
+
+
+@router.callback_query(F.data.startswith("test_ssh:"))
+async def cb_test_ssh(call: CallbackQuery, db: Database, bot: Bot):
+    server_id = int(call.data.split(":")[1])
+    server = await db.get_server(server_id, call.from_user.id)
+    if not server:
+        await call.answer("Сервер не найден", show_alert=True)
+        return
+
+    await call.message.edit_text("🔌 Проверка SSH-подключения...", parse_mode="HTML")
+
+    try:
+        ssh = SSHManager(
+            host=server["host"],
+            port=server["ssh_port"],
+            username=server["username"],
+            password=server["credential"] if server["auth_type"] == "password" else None,
+            key=server["credential"] if server["auth_type"] == "key" else None,
+        )
+        async with ssh:
+            installer = ProxyInstaller(ssh)
+            info = await installer.check_server()
+
+        await bot.edit_message_text(
+            f"✅ <b>SSH-подключение успешно!</b>\n\n"
+            f"🖥 ОС: {info.get('os', 'н/д')}\n"
+            f"🌐 IP: <code>{info.get('ip', 'н/д')}</code>\n"
+            f"🐳 Docker: {'установлен' if info.get('docker') else 'не установлен'}\n"
+            f"📡 Прокси: {'работает' if info.get('proxy_running') else 'не запущен'}",
+            chat_id=call.message.chat.id,
+            message_id=call.message.message_id,
+            reply_markup=kb.server_actions(server_id, server["status"]),
+            parse_mode="HTML",
+        )
+    except Exception as e:
+        error_text = str(e)
+        if "Authentication failed" in error_text:
+            error_text = "Ошибка авторизации. Проверьте логин/пароль."
+        elif "timed out" in error_text:
+            error_text = "Таймаут подключения. Проверьте IP и доступность."
+        elif "No route to host" in error_text or "Connection refused" in error_text:
+            error_text = "Сервер недоступен. Проверьте IP и SSH-порт."
+
+        await bot.edit_message_text(
+            f"❌ <b>SSH-подключение не удалось</b>\n\n{error_text}",
+            chat_id=call.message.chat.id,
+            message_id=call.message.message_id,
+            reply_markup=kb.server_actions(server_id, server["status"]),
+            parse_mode="HTML",
+        )
 
 
 # ──────────────────────────────────────────────────────────
@@ -810,3 +1002,85 @@ async def fsm_edit_setting(message: Message, state: FSMContext, db: Database):
         reply_markup=kb.server_actions(server_id, server["status"] if server else "new"),
         parse_mode="HTML",
     )
+
+
+# ──────────────────────────────────────────────────────────
+# Admin panel
+# ──────────────────────────────────────────────────────────
+
+@router.message(Command("admin"))
+async def cmd_admin(message: Message, db: Database):
+    if message.from_user.id not in ADMIN_IDS:
+        await message.answer("⛔ Доступ запрещён.")
+        return
+
+    stats = await db.get_stats()
+    by_status = stats.get("by_status", {})
+
+    installed = by_status.get("installed", 0)
+    new = by_status.get("new", 0)
+    error = by_status.get("error", 0)
+
+    await message.answer(
+        f"👑 <b>Админ-панель</b>\n\n"
+        f"👤 Пользователей: <b>{stats['users']}</b>\n"
+        f"👤 С серверами: <b>{stats['users_with_servers']}</b>\n\n"
+        f"🖥 Серверов всего: <b>{stats['servers']}</b>\n"
+        f"🟢 Установлено: <b>{installed}</b>\n"
+        f"⚪ Новых: <b>{new}</b>\n"
+        f"🔴 С ошибкой: <b>{error}</b>\n\n"
+        f"<b>Команды:</b>\n"
+        f"/admin — эта панель\n"
+        f"/allusers — все пользователи\n"
+        f"/allservers — все серверы",
+        parse_mode="HTML",
+    )
+
+
+@router.message(Command("allusers"))
+async def cmd_all_users(message: Message, db: Database):
+    if message.from_user.id not in ADMIN_IDS:
+        await message.answer("⛔ Доступ запрещён.")
+        return
+
+    users = await db.get_all_users()
+    if not users:
+        await message.answer("Пользователей пока нет.")
+        return
+
+    lines = ["👤 <b>Все пользователи:</b>\n"]
+    for u in users[:50]:
+        name = u["first_name"] or u["username"] or str(u["user_id"])
+        admin_mark = " 👑" if u["is_admin"] else ""
+        lines.append(f"• <code>{u['user_id']}</code> — {name}{admin_mark}")
+
+    if len(users) > 50:
+        lines.append(f"\n<i>... и ещё {len(users) - 50}</i>")
+
+    await message.answer("\n".join(lines), parse_mode="HTML")
+
+
+@router.message(Command("allservers"))
+async def cmd_all_servers(message: Message, db: Database):
+    if message.from_user.id not in ADMIN_IDS:
+        await message.answer("⛔ Доступ запрещён.")
+        return
+
+    servers = await db.get_all_servers()
+    if not servers:
+        await message.answer("Серверов пока нет.")
+        return
+
+    lines = ["🖥 <b>Все серверы:</b>\n"]
+    for s in servers[:30]:
+        status_icon = {"installed": "🟢", "error": "🔴", "new": "⚪"}.get(s["status"], "❓")
+        owner = s.get("tg_username") or str(s["user_id"])
+        lines.append(
+            f"{status_icon} <code>{s['host']}</code> "
+            f":{s['proxy_port']} — @{owner} ({s['name'] or '—'})"
+        )
+
+    if len(servers) > 30:
+        lines.append(f"\n<i>... и ещё {len(servers) - 30}</i>")
+
+    await message.answer("\n".join(lines), parse_mode="HTML")

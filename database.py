@@ -126,3 +126,32 @@ class Database:
             "DELETE FROM servers WHERE id = ? AND user_id = ?", (server_id, user_id)
         )
         await self._db.commit()
+
+    async def get_stats(self) -> dict:
+        """Admin stats: total users, servers, by status."""
+        stats: dict = {}
+        row = await (await self._db.execute("SELECT COUNT(*) FROM users")).fetchone()
+        stats["users"] = row[0]
+        row = await (await self._db.execute("SELECT COUNT(*) FROM servers")).fetchone()
+        stats["servers"] = row[0]
+        cursor = await self._db.execute(
+            "SELECT status, COUNT(*) FROM servers GROUP BY status"
+        )
+        stats["by_status"] = {r[0]: r[1] for r in await cursor.fetchall()}
+        row = await (await self._db.execute(
+            "SELECT COUNT(DISTINCT user_id) FROM servers"
+        )).fetchone()
+        stats["users_with_servers"] = row[0]
+        return stats
+
+    async def get_all_users(self) -> list[dict]:
+        cursor = await self._db.execute("SELECT * FROM users ORDER BY created_at DESC")
+        return [dict(r) for r in await cursor.fetchall()]
+
+    async def get_all_servers(self) -> list[dict]:
+        cursor = await self._db.execute(
+            "SELECT s.*, u.username as tg_username FROM servers s "
+            "LEFT JOIN users u ON s.user_id = u.user_id "
+            "ORDER BY s.created_at DESC"
+        )
+        return [dict(r) for r in await cursor.fetchall()]
