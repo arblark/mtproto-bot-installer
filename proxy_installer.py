@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import logging
 import re
 from dataclasses import dataclass
@@ -18,14 +19,18 @@ from config import (
 logger = logging.getLogger(__name__)
 
 SCRIPT_PATH = "/tmp/mtproto-setup.sh"
+INSTALL_LOG = "/tmp/mtproto-install.log"
+INSTALL_DONE = "/tmp/mtproto-install.done"
 
-# Environment that suppresses every interactive prompt from apt / dpkg / needrestart
-NONINTERACTIVE_ENV = (
-    "export DEBIAN_FRONTEND=noninteractive "
+# Suppresses all interactive prompts from apt / dpkg / needrestart / ucf
+_NONINTERACTIVE = (
+    "DEBIAN_FRONTEND=noninteractive "
     "NEEDRESTART_MODE=a "
     "NEEDRESTART_SUSPEND=1 "
-    'UCF_FORCE_CONFFOLD=1; '
+    "UCF_FORCE_CONFFOLD=1 "
 )
+
+_ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
 
 
 def _parse_config(text: str) -> dict:
@@ -35,6 +40,18 @@ def _parse_config(text: str) -> dict:
             k, v = line.split("=", 1)
             result[k.strip()] = v.strip()
     return result
+
+
+def _last_progress_line(log_text: str) -> str:
+    """Extract the most recent meaningful status line from script output."""
+    for raw_line in reversed(log_text.splitlines()):
+        clean = _ANSI_RE.sub("", raw_line).strip()
+        if not clean:
+            continue
+        for prefix in ("✓", "➜", "✗", "⚠"):
+            if clean.startswith(prefix):
+                return clean
+    return ""
 
 
 @dataclass
@@ -61,11 +78,11 @@ class ProxyInfo:
 
 
 class ProxyInstaller:
-    """Runs the official mtproto-setup.sh via --auto with env-var parameters.
+    """Runs the official mtproto-setup.sh via --auto.
 
-    The bot NEVER duplicates shell logic — every install / update / uninstall
-    delegates to the upstream script.  Only lightweight read-only helpers
-    (check_server, get_status, doctor, get_logs) talk to the server directly.
+    Long-running commands are launched in the background on the remote server
+    (nohup … &) and polled with lightweight SSH calls so the bot stays
+    responsive and can update the Telegram message with live progress.
     """
 
     def __init__(self, ssh: SSHManager):
@@ -115,6 +132,57 @@ class ProxyInstaller:
             base = f"server={info.server_ip}&port={info.port}&secret={info.secret}"
             info.tme_link = f"https://t.me/proxy?{base}"
             info.tg_link = f"tg://proxy?{base}"
+
+    async def _run_script_background(self, args: str, env: str = "") -> None:
+        """Launch script via nohup in background, logging to INSTALL_LOG."""
+        await self.ssh.execute(f"rm -f {INSTALL_LOG} {INSTALL_DONE}")
+        cmd = (
+            f"nohup bash -c '"
+            f"export {_NONINTERACTIVE}; "
+            f"{env} "
+            f"bash {SCRIPT_PATH} {args} > {INSTALL_LOG} 2>&1; "
+            f"echo $? > {INSTALL_DONE}"
+            f"' > /dev/null 2>&1 &"
+        )
+        await self.ssh.execute(cmd)
+
+    async def _poll_until_done(self, timeout: int, progress_cb=None) -> tuple:
+        """Poll INSTALL_DONE marker, calling progress_cb with latest log line.
+
+        Returns (exit_code: int, log_text: str).
+        """
+        elapsed = 0
+        interval = 5
+        prev_line = ""
+
+        while elapsed < timeout:
+            await asyncio.sleep(interval)
+            elapsed += interval
+
+            r = await self.ssh.execute(f"cat {INSTALL_DONE} 2>/dev/null")
+            done = r.ok and r.stdout.strip().isdigit()
+
+            tail = await self.ssh.execute(f"tail -20 {INSTALL_LOG} 2>/dev/null")
+            current_line = _last_progress_line(tail.stdout) if tail.ok else ""
+
+            if current_line and current_line != prev_line and progress_cb:
+                await progress_cb("script", current_line)
+                prev_line = current_line
+
+            if done:
+                exit_code = int(r.stdout.strip())
+                full = await self.ssh.execute(f"cat {INSTALL_LOG} 2>/dev/null")
+                log_text = full.stdout if full.ok else ""
+                await self.ssh.execute(f"rm -f {INSTALL_LOG} {INSTALL_DONE}")
+                return exit_code, log_text
+
+        await self.ssh.execute(
+            f"kill $(pgrep -f '{SCRIPT_PATH}') 2>/dev/null || true"
+        )
+        full = await self.ssh.execute(f"cat {INSTALL_LOG} 2>/dev/null")
+        log_text = full.stdout if full.ok else ""
+        await self.ssh.execute(f"rm -f {INSTALL_LOG} {INSTALL_DONE}")
+        return -1, log_text
 
     # ── public: read-only checks ────────────────────────────────
 
@@ -187,7 +255,7 @@ class ProxyInstaller:
     # ── public: mutating operations (all via script) ────────────
 
     async def install(self, cfg: ProxyConfig, progress_cb=None) -> ProxyInfo:
-        """Full install via mtproto-setup.sh --auto."""
+        """Full install: download script → run --auto in background → poll."""
         result = ProxyInfo()
 
         async def _p(step: str, msg: str):
@@ -208,25 +276,22 @@ class ProxyInstaller:
                 return result
             await _p("download", "Скрипт скачан")
 
-            await _p("install", "Запуск установки (это может занять 2-4 мин)...")
+            await _p("install", "Запуск установки...")
 
             env = self._env_prefix(cfg, server_ip=result.server_ip)
-            cmd = (
-                f"{NONINTERACTIVE_ENV}"
-                f"{env} "
-                f"bash {SCRIPT_PATH} --auto 2>&1"
-            )
-            r = await self.ssh.execute(cmd, timeout=INSTALL_TIMEOUT)
+            await self._run_script_background("--auto", env=env)
 
-            output = r.stdout
-            if not r.ok:
+            exit_code, log_text = await self._poll_until_done(
+                timeout=INSTALL_TIMEOUT,
+                progress_cb=_p,
+            )
+
+            if exit_code != 0:
                 result.error = (
-                    f"Скрипт завершился с ошибкой (код {r.exit_code}):\n"
-                    f"{output[-800:]}"
+                    f"Скрипт завершился с ошибкой (код {exit_code}):\n"
+                    f"{log_text[-800:]}"
                 )
                 return result
-
-            await _p("install", "Скрипт выполнен")
 
             await _p("config", "Чтение результатов...")
             cv = await self._read_remote_config()
@@ -238,7 +303,7 @@ class ProxyInstaller:
                 result.dns = cv.get("DNS_SERVER", cfg.dns)
                 result.container = cv.get("CONTAINER_NAME", cfg.container)
             else:
-                m = re.search(r"secret=([a-f0-9]+)", output)
+                m = re.search(r"secret=([a-f0-9]+)", log_text)
                 result.secret = m.group(1) if m else ""
                 result.port = cfg.port
                 result.domain = cfg.domain
@@ -256,7 +321,7 @@ class ProxyInstaller:
         return result
 
     async def update(self, container: str = DEFAULT_CONTAINER) -> ProxyInfo:
-        """Update via mtproto-setup.sh --update."""
+        """Update via mtproto-setup.sh --update (background + poll)."""
         status = await self.get_status(container)
         if not status.secret:
             status.error = "Конфигурация не найдена на сервере"
@@ -266,12 +331,11 @@ class ProxyInstaller:
             status.error = "Не удалось скачать скрипт"
             return status
 
-        r = await self.ssh.execute(
-            f"bash {SCRIPT_PATH} --update 2>&1",
-            timeout=INSTALL_TIMEOUT,
-        )
-        if not r.ok:
-            status.error = f"Ошибка обновления:\n{(r.stdout + r.stderr)[-500:]}"
+        await self._run_script_background("--update")
+        exit_code, log_text = await self._poll_until_done(timeout=INSTALL_TIMEOUT)
+
+        if exit_code != 0:
+            status.error = f"Ошибка обновления:\n{log_text[-500:]}"
             return status
 
         updated = await self.get_status(container)
@@ -279,7 +343,7 @@ class ProxyInstaller:
         return updated
 
     async def uninstall(self, container: str = DEFAULT_CONTAINER) -> str:
-        """Uninstall: try script, then force-clean remains."""
+        """Uninstall: try script, then force-clean."""
         if await self._download_script():
             await self.ssh.execute(
                 f"echo -e 'y\\ny\\n' | bash {SCRIPT_PATH} --uninstall 2>&1 || true",

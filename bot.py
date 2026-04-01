@@ -444,7 +444,14 @@ async def cb_install(call: CallbackQuery, db: Database, bot: Bot):
     steps_done = []
 
     async def progress_cb(step: str, msg: str):
-        steps_done.append(f"{'✅' if step != 'done' else '🎉'} {msg}")
+        if step == "script" and steps_done and steps_done[-1].startswith("🔄"):
+            steps_done[-1] = f"🔄 {msg}"
+        elif step == "script":
+            steps_done.append(f"🔄 {msg}")
+        else:
+            if steps_done and steps_done[-1].startswith("🔄"):
+                steps_done[-1] = f"✅ {steps_done[-1][2:]}"
+            steps_done.append(f"{'✅' if step != 'done' else '🎉'} {msg}")
         text = "🚀 <b>Установка MTProto Proxy</b>\n\n" + "\n".join(steps_done)
         try:
             await bot.edit_message_text(
