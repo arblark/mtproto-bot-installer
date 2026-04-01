@@ -30,6 +30,14 @@ _NONINTERACTIVE = (
     "UCF_FORCE_CONFFOLD=1 "
 )
 
+# Dropped into /etc/apt/apt.conf.d/ before running any apt commands.
+# --force-confold tells dpkg to keep the existing config file without asking.
+_DPKG_FORCE_CONFOLD = (
+    'mkdir -p /etc/apt/apt.conf.d && '
+    'echo \'Dpkg::Options { "--force-confdef"; "--force-confold"; }\' '
+    '> /etc/apt/apt.conf.d/99force-confold; '
+)
+
 _ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
 
 
@@ -136,6 +144,7 @@ class ProxyInstaller:
     async def _run_script_background(self, args: str, env: str = "") -> None:
         """Launch script via nohup in background, logging to INSTALL_LOG."""
         await self.ssh.execute(f"rm -f {INSTALL_LOG} {INSTALL_DONE}")
+        await self.ssh.execute(_DPKG_FORCE_CONFOLD)
         cmd = (
             f"nohup bash -c '"
             f"export {_NONINTERACTIVE}; "
