@@ -81,6 +81,68 @@ class SSHManager:
 
         return await asyncio.get_event_loop().run_in_executor(None, _exec)
 
+    async def execute_stream(
+        self, command: str, timeout: int = 600, on_output: callable = None,
+    ) -> SSHResult:
+        """Execute command and call on_output(line) for each line of stdout."""
+        if not self._client:
+            raise RuntimeError("SSH не подключён")
+
+        def _exec():
+            transport = self._client.get_transport()
+            channel = transport.open_session()
+            channel.settimeout(timeout)
+            channel.exec_command(command)
+
+            stdout_chunks = []
+            stderr_chunks = []
+            buf = ""
+
+            while True:
+                if channel.recv_ready():
+                    data = channel.recv(4096).decode("utf-8", errors="replace")
+                    stdout_chunks.append(data)
+                    if on_output:
+                        buf += data
+                        while "\n" in buf:
+                            line, buf = buf.split("\n", 1)
+                            line = line.strip()
+                            if line:
+                                on_output(line)
+                if channel.recv_stderr_ready():
+                    stderr_chunks.append(
+                        channel.recv_stderr(4096).decode("utf-8", errors="replace")
+                    )
+                if channel.exit_status_ready():
+                    while channel.recv_ready():
+                        data = channel.recv(4096).decode("utf-8", errors="replace")
+                        stdout_chunks.append(data)
+                        if on_output:
+                            buf += data
+                            while "\n" in buf:
+                                line, buf = buf.split("\n", 1)
+                                line = line.strip()
+                                if line:
+                                    on_output(line)
+                    while channel.recv_stderr_ready():
+                        stderr_chunks.append(
+                            channel.recv_stderr(4096).decode("utf-8", errors="replace")
+                        )
+                    break
+                import time
+                time.sleep(0.1)
+
+            if on_output and buf.strip():
+                on_output(buf.strip())
+
+            return SSHResult(
+                exit_code=channel.recv_exit_status(),
+                stdout="".join(stdout_chunks),
+                stderr="".join(stderr_chunks),
+            )
+
+        return await asyncio.get_event_loop().run_in_executor(None, _exec)
+
     async def upload_string(self, content: str, remote_path: str) -> None:
         if not self._client:
             raise RuntimeError("SSH не подключён")

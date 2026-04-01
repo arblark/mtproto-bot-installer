@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import logging
 import re
 from dataclasses import dataclass
@@ -153,10 +154,25 @@ class ProxyInstaller:
 
             await _progress("install", "Запуск установки (--auto)...")
             env_prefix = self._build_env(cfg, server_ip=result.server_ip)
-            r = await self.ssh.execute(
-                f"{env_prefix} bash {SCRIPT_PATH} --auto",
+
+            last_status = {"text": ""}
+            loop = asyncio.get_event_loop()
+
+            def _on_line(line: str):
+                clean = re.sub(r"\x1b\[[0-9;]*m", "", line).strip()
+                if not clean:
+                    return
+                if clean.startswith("✓") or clean.startswith("➜") or clean.startswith("✗"):
+                    last_status["text"] = clean
+
+            r = await self.ssh.execute_stream(
+                f"{env_prefix} bash {SCRIPT_PATH} --auto 2>&1",
                 timeout=INSTALL_TIMEOUT,
+                on_output=_on_line,
             )
+
+            if last_status["text"]:
+                await _progress("install", last_status["text"])
 
             output = r.stdout + "\n" + r.stderr
             if not r.ok:
