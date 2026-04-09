@@ -12,6 +12,7 @@ from config import (
     DEFAULT_DOMAIN,
     DEFAULT_IP_MODE,
     DEFAULT_PORT,
+    DEFAULT_TLS_MODE,
     INSTALL_TIMEOUT,
     MTPROTO_SETUP_URL,
 )
@@ -69,6 +70,9 @@ class ProxyConfig:
     dns: str = DEFAULT_DNS
     ip_mode: str = DEFAULT_IP_MODE
     container: str = DEFAULT_CONTAINER
+    tls_mode: str = DEFAULT_TLS_MODE
+    real_domain: str = ""
+    le_email: str = ""
 
 
 @dataclass
@@ -81,6 +85,7 @@ class ProxyInfo:
     container: str = ""
     tme_link: str = ""
     tg_link: str = ""
+    tls_mode: str = "fake"
     status: str = "unknown"
     error: str = ""
 
@@ -113,12 +118,18 @@ class ProxyInstaller:
     @staticmethod
     def _env_prefix(cfg: ProxyConfig, server_ip: str = "") -> str:
         parts = [
+            f"MT_TLS_MODE={cfg.tls_mode}",
             f"MT_PORT={cfg.port}",
-            f"MT_DOMAIN={cfg.domain}",
             f"MT_DNS={cfg.dns}",
             f"MT_IP_MODE={cfg.ip_mode}",
             f"MT_CONTAINER={cfg.container}",
         ]
+        if cfg.tls_mode == "real" and cfg.real_domain:
+            parts.append(f"MT_DOMAIN={cfg.real_domain}")
+            if cfg.le_email:
+                parts.append(f"MT_LE_EMAIL={cfg.le_email}")
+        else:
+            parts.append(f"MT_DOMAIN={cfg.domain}")
         if server_ip:
             parts.insert(0, f"MT_SERVER_IP={server_ip}")
         return " ".join(parts)
@@ -222,9 +233,10 @@ class ProxyInstaller:
             result.server_ip = cv.get("SERVER_IP", "")
             result.port = int(cv["EXT_PORT"]) if cv.get("EXT_PORT", "").isdigit() else 443
             result.secret = cv.get("SECRET", "")
-            result.domain = cv.get("FAKE_DOMAIN", "")
+            result.domain = cv.get("FAKE_DOMAIN", cv.get("REAL_DOMAIN", ""))
             result.dns = cv.get("DNS_SERVER", "")
             result.container = cv.get("CONTAINER_NAME", container)
+            result.tls_mode = cv.get("TLS_MODE", "fake")
 
         r = await self.ssh.execute(
             f"docker ps --format '{{{{.Names}}}}' 2>/dev/null | grep -qw {container}"
@@ -234,6 +246,14 @@ class ProxyInstaller:
         return result
 
     async def doctor(self, container: str = DEFAULT_CONTAINER) -> str:
+        if await self._download_script():
+            r = await self.ssh.execute(
+                f"bash {SCRIPT_PATH} --doctor 2>&1", timeout=60,
+            )
+            output = r.stdout.strip()
+            if output:
+                return _ANSI_RE.sub("", output)
+
         r = await self.ssh.execute(
             f"docker ps --format '{{{{.Names}}}}' 2>/dev/null | grep -qw {container}"
         )
@@ -308,9 +328,10 @@ class ProxyInstaller:
                 result.server_ip = cv.get("SERVER_IP", info["ip"])
                 result.port = int(cv["EXT_PORT"]) if cv.get("EXT_PORT", "").isdigit() else cfg.port
                 result.secret = cv.get("SECRET", "")
-                result.domain = cv.get("FAKE_DOMAIN", cfg.domain)
+                result.domain = cv.get("FAKE_DOMAIN", cv.get("REAL_DOMAIN", cfg.domain))
                 result.dns = cv.get("DNS_SERVER", cfg.dns)
                 result.container = cv.get("CONTAINER_NAME", cfg.container)
+                result.tls_mode = cv.get("TLS_MODE", cfg.tls_mode)
             else:
                 m = re.search(r"secret=([a-f0-9]+)", log_text)
                 result.secret = m.group(1) if m else ""
@@ -318,6 +339,7 @@ class ProxyInstaller:
                 result.domain = cfg.domain
                 result.dns = cfg.dns
                 result.container = cfg.container
+                result.tls_mode = cfg.tls_mode
 
             self._fill_links(result)
             result.status = "running"

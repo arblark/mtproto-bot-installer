@@ -10,7 +10,7 @@ from aiogram.fsm.state import State, StatesGroup
 from database import Database
 from ssh_manager import SSHManager
 from proxy_installer import ProxyInstaller, ProxyConfig, ProxyInfo
-from config import ADMIN_IDS, DEFAULT_PORT, DEFAULT_DOMAIN, DEFAULT_DNS
+from config import ADMIN_IDS, DEFAULT_PORT, DEFAULT_DOMAIN, DEFAULT_DNS, DEFAULT_TLS_MODE
 import keyboards as kb
 
 logger = logging.getLogger(__name__)
@@ -24,8 +24,11 @@ class AddServer(StatesGroup):
     username = State()
     auth_type = State()
     credential = State()
+    tls_mode = State()
     proxy_port = State()
     domain = State()
+    real_domain = State()
+    le_email = State()
     dns = State()
     dns_custom = State()
 
@@ -257,11 +260,85 @@ async def fsm_credential(message: Message, state: FSMContext):
     except Exception:
         pass
 
-    await state.set_state(AddServer.proxy_port)
+    await state.set_state(AddServer.tls_mode)
     await message.answer(
-        f"🔌 Введите <b>порт прокси</b> (по умолчанию {DEFAULT_PORT}):\n"
-        f"<i>443 — лучший выбор для обхода блокировок</i>",
+        "🔐 <b>Выберите режим TLS</b>\n\n"
+        "🔒 <b>Fake-TLS</b> — стандартный режим.\n"
+        "Прокси маскируется под HTTPS-трафик к указанному домену.\n\n"
+        "🛡 <b>Real-TLS</b> — максимальная маскировка.\n"
+        "Используется реальный домен + Let's Encrypt сертификат + nginx.\n"
+        "Трафик неотличим от настоящего HTTPS. Требуется свой домен.",
+        reply_markup=kb.tls_mode_selector(),
+        parse_mode="HTML",
+    )
+
+
+@router.callback_query(F.data.startswith("tls_mode:"), AddServer.tls_mode)
+async def fsm_tls_mode(call: CallbackQuery, state: FSMContext):
+    mode = call.data.split(":", 1)[1]
+    await state.update_data(tls_mode=mode)
+
+    if mode == "real":
+        await state.set_state(AddServer.real_domain)
+        await call.message.edit_text(
+            "🛡 <b>Real-TLS: домен</b>\n\n"
+            "Введите <b>ваш реальный домен</b>, A-запись которого "
+            "указывает на этот сервер.\n\n"
+            "<i>Например: proxy.example.com</i>",
+            reply_markup=kb.cancel_kb(),
+            parse_mode="HTML",
+        )
+    else:
+        await state.set_state(AddServer.proxy_port)
+        await call.message.edit_text(
+            f"🔌 Введите <b>порт прокси</b> (по умолчанию {DEFAULT_PORT}):\n"
+            f"<i>443 — лучший выбор для обхода блокировок</i>",
+            reply_markup=kb.cancel_kb(),
+            parse_mode="HTML",
+        )
+
+
+@router.message(AddServer.real_domain)
+async def fsm_real_domain(message: Message, state: FSMContext):
+    real_domain = message.text.strip()
+    if not real_domain or " " in real_domain:
+        await message.answer(
+            "❌ Некорректный домен. Введите домен без пробелов, например: proxy.example.com",
+            reply_markup=kb.cancel_kb(),
+        )
+        return
+    await state.update_data(real_domain=real_domain, domain=real_domain, proxy_port=443)
+    await state.set_state(AddServer.le_email)
+    await message.answer(
+        "📧 <b>Real-TLS: email для Let's Encrypt</b>\n\n"
+        "Введите email для получения SSL-сертификата.\n"
+        "<i>Certbot использует его для уведомлений об истечении.</i>",
         reply_markup=kb.cancel_kb(),
+        parse_mode="HTML",
+    )
+
+
+@router.message(AddServer.le_email)
+async def fsm_le_email(message: Message, state: FSMContext):
+    email = message.text.strip()
+    if not email or "@" not in email:
+        await message.answer(
+            "❌ Введите корректный email, например: user@example.com",
+            reply_markup=kb.cancel_kb(),
+        )
+        return
+    await state.update_data(le_email=email)
+    await state.set_state(AddServer.dns)
+
+    lines = ["📡 <b>Выберите DNS-сервер:</b>\n"]
+    for ip, desc in DNS_INFO.items():
+        lines.append(f"<code>{ip}</code> — {desc}")
+    lines.append("\n<i>DNS влияет на скорость резолва доменов внутри прокси.\n"
+                 "Cloudflare (1.1.1.1) — лучший выбор для большинства.</i>")
+
+    await message.answer(
+        "\n".join(lines),
+        reply_markup=kb.dns_selector(),
         parse_mode="HTML",
     )
 
@@ -339,6 +416,10 @@ async def _save_server(msg, state: FSMContext, db: Database, user_id: int, dns: 
     data = await state.get_data()
     await state.clear()
 
+    tls_mode = data.get("tls_mode", DEFAULT_TLS_MODE)
+    real_domain = data.get("real_domain", "")
+    le_email = data.get("le_email", "")
+
     server_id = await db.add_server(
         user_id=user_id,
         name=data["name"],
@@ -347,19 +428,30 @@ async def _save_server(msg, state: FSMContext, db: Database, user_id: int, dns: 
         username=data["username"],
         auth_type=data["auth_type"],
         credential=data["credential"],
-        proxy_port=data["proxy_port"],
-        domain=data["domain"],
+        proxy_port=data.get("proxy_port", DEFAULT_PORT),
+        domain=data.get("domain", DEFAULT_DOMAIN),
         dns=dns,
+        tls_mode=tls_mode,
+        real_domain=real_domain,
+        le_email=le_email,
     )
 
     dns_label = DNS_INFO.get(dns, dns)
+    tls_label = "🛡 Real-TLS" if tls_mode == "real" else "🔒 Fake-TLS"
     text = (
         f"✅ <b>Сервер добавлен!</b>\n\n"
         f"📛 {data['name']}\n"
         f"🌐 {data['host']}:{data['ssh_port']}\n"
         f"👤 {data['username']}\n"
-        f"🔌 Порт прокси: {data['proxy_port']}\n"
-        f"🌍 Домен: {data['domain']}\n"
+        f"🔐 Режим: {tls_label}\n"
+        f"🔌 Порт прокси: {data.get('proxy_port', DEFAULT_PORT)}\n"
+    )
+    if tls_mode == "real":
+        text += f"🌍 Домен: {real_domain}\n"
+        text += f"📧 LE email: {le_email}\n"
+    else:
+        text += f"🌍 Домен маскировки: {data.get('domain', DEFAULT_DOMAIN)}\n"
+    text += (
         f"📡 DNS: {dns} ({dns_label})\n\n"
         f"Нажмите «Установить прокси» для запуска установки."
     )
@@ -402,17 +494,28 @@ async def cb_server_detail(call: CallbackQuery, db: Database):
         server["status"], server["status"]
     )
 
+    tls_mode = server.get("tls_mode", "fake")
+    tls_label = "🛡 Real-TLS" if tls_mode == "real" else "🔒 Fake-TLS"
+
     text = (
         f"📛 <b>{server['name'] or server['host']}</b>\n\n"
         f"🌐 Хост: <code>{server['host']}</code>\n"
         f"🔌 SSH: {server['ssh_port']} | Прокси: {server['proxy_port']}\n"
         f"👤 {server['username']}\n"
-        f"🌍 Домен: {server['domain']}\n"
+        f"🔐 Режим: {tls_label}\n"
+    )
+    if tls_mode == "real":
+        text += f"🌍 Домен: {server.get('real_domain', server['domain'])}\n"
+        if server.get("le_email"):
+            text += f"📧 LE email: {server['le_email']}\n"
+    else:
+        text += f"🌍 Домен маскировки: {server['domain']}\n"
+    text += (
         f"📡 DNS: {server['dns']}\n"
         f"📊 Статус: {status_text}\n"
     )
 
-    if server["tme_link"]:
+    if server.get("tme_link"):
         text += f"\n🔗 <a href=\"{server['tme_link']}\">Подключиться к прокси</a>\n"
 
     await call.message.edit_text(
@@ -478,6 +581,9 @@ async def cb_install(call: CallbackQuery, db: Database, bot: Bot):
                 port=server["proxy_port"],
                 domain=server["domain"],
                 dns=server["dns"],
+                tls_mode=server.get("tls_mode", "fake"),
+                real_domain=server.get("real_domain", ""),
+                le_email=server.get("le_email", ""),
             )
             result = await installer.install(cfg, progress_cb=progress_cb)
 
@@ -500,15 +606,21 @@ async def cb_install(call: CallbackQuery, db: Database, bot: Bot):
             tme_link=result.tme_link,
         )
 
-        await bot.edit_message_text(
+        tls_label = "🛡 Real-TLS" if result.tls_mode == "real" else "🔒 Fake-TLS"
+        success_text = (
             f"🎉 <b>Прокси установлен!</b>\n\n"
             f"🌐 Сервер: <code>{result.server_ip}</code>\n"
             f"🔌 Порт: <code>{result.port}</code>\n"
             f"🔑 Секрет: <code>{result.secret}</code>\n"
+            f"🔐 Режим: {tls_label}\n"
             f"🌍 Домен: {result.domain}\n\n"
             f"📱 <b>Ссылка для подключения:</b>\n"
             f"<a href=\"{result.tme_link}\">👉 Подключиться к прокси</a>\n\n"
-            f"<code>{result.tme_link}</code>",
+            f"<code>{result.tme_link}</code>"
+        )
+
+        await bot.edit_message_text(
+            success_text,
             chat_id=call.message.chat.id,
             message_id=status_msg.message_id,
             reply_markup=kb.server_actions(server_id, "installed"),
@@ -564,12 +676,14 @@ async def cb_status(call: CallbackQuery, db: Database, bot: Bot):
 
         status_icon = "🟢" if info.status == "running" else "🔴"
         status_text = "Работает" if info.status == "running" else "Остановлен"
+        tls_label = "🛡 Real-TLS" if info.tls_mode == "real" else "🔒 Fake-TLS"
 
         await bot.edit_message_text(
             f"📊 <b>Статус прокси</b>\n\n"
             f"{status_icon} {status_text}\n"
             f"🌐 IP: <code>{info.server_ip}</code>\n"
             f"🔌 Порт: <code>{info.port}</code>\n"
+            f"🔐 Режим: {tls_label}\n"
             f"🌍 Домен: {info.domain}\n"
             f"📡 DNS: {info.dns}",
             chat_id=call.message.chat.id,

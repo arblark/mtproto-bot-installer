@@ -88,6 +88,20 @@ def back_to_server(server_id: int) -> InlineKeyboardMarkup:
     ])
 
 
+def tls_mode_selector() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(
+            text="🔒 Fake-TLS — стандартный",
+            callback_data="tls_mode:fake",
+        )],
+        [InlineKeyboardButton(
+            text="🛡 Real-TLS — максимальная маскировка",
+            callback_data="tls_mode:real",
+        )],
+        [InlineKeyboardButton(text="❌ Отмена", callback_data="cancel")],
+    ])
+
+
 def dns_selector() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="1.1.1.1 — Cloudflare", callback_data="dns:1.1.1.1")],

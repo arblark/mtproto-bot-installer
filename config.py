@@ -17,8 +17,9 @@ MTPROTO_SETUP_URL = (
 DEFAULT_PORT = 443
 DEFAULT_DOMAIN = "apple.com"
 DEFAULT_DNS = "1.1.1.1"
-DEFAULT_IP_MODE = "prefer-ipv4"
+DEFAULT_IP_MODE = "prefer-ipv6"
 DEFAULT_CONTAINER = "mtproto"
+DEFAULT_TLS_MODE = "fake"
 
 DB_PATH = "bot_data.db"
 

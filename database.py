@@ -20,6 +20,9 @@ CREATE TABLE IF NOT EXISTS servers (
     proxy_port  INTEGER DEFAULT 443,
     domain      TEXT DEFAULT 'apple.com',
     dns         TEXT DEFAULT '1.1.1.1',
+    tls_mode    TEXT DEFAULT 'fake',                -- 'fake' | 'real'
+    real_domain TEXT DEFAULT '',                     -- domain for Real-TLS
+    le_email    TEXT DEFAULT '',                     -- Let's Encrypt email
     secret      TEXT DEFAULT '',
     status      TEXT DEFAULT 'new',                 -- new | installed | error
     server_ip   TEXT DEFAULT '',
@@ -37,6 +40,12 @@ CREATE TABLE IF NOT EXISTS users (
 );
 """
 
+_MIGRATIONS = [
+    ("tls_mode", "TEXT DEFAULT 'fake'"),
+    ("real_domain", "TEXT DEFAULT ''"),
+    ("le_email", "TEXT DEFAULT ''"),
+]
+
 
 class Database:
     def __init__(self, path: str = DB_PATH):
@@ -47,6 +56,17 @@ class Database:
         self._db = await aiosqlite.connect(self.path)
         self._db.row_factory = aiosqlite.Row
         await self._db.executescript(CREATE_TABLES)
+        await self._db.commit()
+        await self._migrate()
+
+    async def _migrate(self):
+        for col, typedef in _MIGRATIONS:
+            try:
+                await self._db.execute(
+                    f"ALTER TABLE servers ADD COLUMN {col} {typedef}"
+                )
+            except Exception:
+                pass
         await self._db.commit()
 
     async def close(self):
@@ -76,13 +96,18 @@ class Database:
         proxy_port: int = 443,
         domain: str = "apple.com",
         dns: str = "1.1.1.1",
+        tls_mode: str = "fake",
+        real_domain: str = "",
+        le_email: str = "",
     ) -> int:
         encrypted_credential = encrypt(credential)
         cursor = await self._db.execute(
             """INSERT INTO servers
-               (user_id, name, host, ssh_port, username, auth_type, credential, proxy_port, domain, dns)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-            (user_id, name, host, ssh_port, username, auth_type, encrypted_credential, proxy_port, domain, dns),
+               (user_id, name, host, ssh_port, username, auth_type, credential,
+                proxy_port, domain, dns, tls_mode, real_domain, le_email)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (user_id, name, host, ssh_port, username, auth_type, encrypted_credential,
+             proxy_port, domain, dns, tls_mode, real_domain, le_email),
         )
         await self._db.commit()
         return cursor.lastrowid
@@ -128,7 +153,6 @@ class Database:
         await self._db.commit()
 
     async def get_stats(self) -> dict:
-        """Admin stats: total users, servers, by status."""
         stats: dict = {}
         row = await (await self._db.execute("SELECT COUNT(*) FROM users")).fetchone()
         stats["users"] = row[0]
